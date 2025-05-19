@@ -14,12 +14,15 @@ import os
 import h5py
 import tempfile
 from einops import rearrange
+from torchvision.transforms.functional import to_pil_image
+from tqdm import tqdm
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 def get_model():
     config = OmegaConf.load("./config_vg.yaml")
-    model = load_model_from_config(config, "./pretrained_model.ckpt")
+    # model = load_model_from_config(config, "./pretrained_model.ckpt")
+    model = load_model_from_config(config, "./pretrained/last.ckpt")
     return model
 
 def build_loaders():
@@ -53,9 +56,10 @@ def main():
 
     loader = build_loaders()
 
-    root_dir = './test_results'
+    root_dir = './test_results_whole_test'
     scene_graph_dir = os.path.join(root_dir, 'scene_graph')
     generate_img_dir = os.path.join(root_dir, 'img')
+    gt_img_dir = os.path.join(root_dir, 'gt_img')
 
     if not os.path.exists(root_dir):
         os.mkdir(root_dir)
@@ -63,16 +67,19 @@ def main():
         os.mkdir(scene_graph_dir)
     if not os.path.exists(generate_img_dir):
         os.mkdir(generate_img_dir)
+    if not os.path.exists(gt_img_dir):
+        os.mkdir(gt_img_dir)
 
+    num_sample_times = 1
     n_samples_per_scene_graph = 1
 
     with torch.no_grad():
         with model.ema_scope():
             img_idx = -1
-            for batch_data in loader:
+            for batch_data in tqdm(loader):
                 img_idx += 1
-                if img_idx < 2500:
-                    continue
+                # if img_idx < 2500:
+                #     continue
                 imgs, objs, boxes, triples, obj_to_img, triple_to_img = [x.cuda() for x in batch_data]
 
                 scene_graph_path = os.path.join(scene_graph_dir, str(img_idx)+'_graph.png')
@@ -81,21 +88,24 @@ def main():
                 graph_info = [imgs, objs, None, triples, obj_to_img, triple_to_img]
                 cond = model.get_learned_conditioning(graph_info)
 
-                samples_ddim, _ = sampler.sample(S=ddim_steps,
-                                                 conditioning=cond,
-                                                 batch_size=n_samples_per_scene_graph,
-                                                 shape=[4, 32, 32],
-                                                 verbose=False,
-                                                 eta=ddim_eta)
+                for num_sample in range(num_sample_times):
+                    samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                                    conditioning=cond,
+                                                    batch_size=n_samples_per_scene_graph,
+                                                    shape=[4, 32, 32],
+                                                    verbose=False,
+                                                    eta=ddim_eta)
 
-                x_samples_ddim = model.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                x_samples_ddim = x_samples_ddim.squeeze(0)
-                x_samples_ddim = 255. * rearrange(x_samples_ddim, 'c h w -> h w c').cpu().numpy()
-                results = Image.fromarray(x_samples_ddim.astype(np.uint8))
-                results.save(os.path.join(generate_img_dir, str(img_idx)+'_img.png'))                
-                if img_idx > 3000:
-                    break
+                    x_samples_ddim = model.decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                    x_samples_ddim = x_samples_ddim.squeeze(0)
+                    x_samples_ddim = 255. * rearrange(x_samples_ddim, 'c h w -> h w c').cpu().numpy()
+                    results = Image.fromarray(x_samples_ddim.astype(np.uint8))
+                    results.save(os.path.join(generate_img_dir, str(img_idx)+'_'+str(num_sample)+'_img.png'))
+                gt_img = to_pil_image(imgs[0], mode="RGB")
+                gt_img.save(os.path.join(gt_img_dir, str(img_idx)+'_gt.png'))
+                # if img_idx > 3000:
+                #     break
     return None
 
 def draw_scene_graph(objs, triples, vocab=None, **kwargs):
