@@ -16,6 +16,8 @@ import tempfile
 from einops import rearrange
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
+import argparse
+import pickle
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
@@ -42,8 +44,29 @@ def build_loaders():
     loader = DataLoader(dset, batch_size=1, num_workers=4, shuffle=False, collate_fn=collate_fn)
     return loader
 
+def build_loaders_customized(data_vocab_path, data_path, image_dir):
+    dset_kwargs = {
+        'use_vocab_path': './datasets/vg/vocab.json',
+        'data_vocab_path': data_vocab_path,
+        'data_path': data_path,
+        'image_dir': image_dir,
+        'image_size': (256, 256),
+        'max_samples': None,
+        'max_objects': 30,
+        'use_orphaned_objects': True,
+        'include_relationships': True,
+    }
+    dset = VgSceneGraphDatasetCustomized(**dset_kwargs)
+    collate_fn = vg_collate_fn_customized
+
+    loader = DataLoader(dset, batch_size=1, num_workers=4, shuffle=False, collate_fn=collate_fn)
+    return loader
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--eval_set", type=str, choices=["vg4998", "triplet_swap_val", ""], default="", help="The evaluation set")
+    args = parser.parse_args()
+
     model = get_model()
     sampler = DDIMSampler(model)
 
@@ -54,9 +77,22 @@ def main():
     with open(vocab_file, 'r') as f:
         vocab = json.load(f)
 
-    loader = build_loaders()
+    if args.eval_set == "":
+        loader = build_loaders()
+    else:
+        if args.eval_set == "vg4998":
+            data_vocab_path = "/scratch/bichengx/VG-SGG/V2-Last/idx_to_word.pkl"
+            data_path = "/scratch/bichengx/VG-SGG/V2-Last/validation_common_data_bbox_dbox32_np.pkl"
+            image_dir = "/scratch/bichengx/VG-SGG/VG_100K_3"
+        elif args.eval_set == "triplet_swap_val":
+            data_vocab_path = "/scratch/bichengx/VG-SGG/V2-Last/idx_to_word.pkl"
+            data_path = "/scratch/bichengx/VG-SGG/VG-relation-test/triplet_swaped_dict_validation_1_input.pkl"
+            image_dir = "/scratch/bichengx/VG-SGG/VG-relation-test/triplet_swaped_dict_validation_1_images"
+        else:
+            raise ValueError(f"Unknown eval set: {args.eval_set}")
+        loader = build_loaders_customized(data_vocab_path, data_path, image_dir)
 
-    root_dir = './test_results_whole_test'
+    root_dir = './test_results_whole_test' if args.eval_set == "" else f'./test_results_{args.eval_set}'
     scene_graph_dir = os.path.join(root_dir, 'scene_graph')
     generate_img_dir = os.path.join(root_dir, 'img')
     gt_img_dir = os.path.join(root_dir, 'gt_img')
@@ -70,7 +106,7 @@ def main():
     if not os.path.exists(gt_img_dir):
         os.mkdir(gt_img_dir)
 
-    num_sample_times = 1
+    num_sample_times = 5
     n_samples_per_scene_graph = 1
 
     with torch.no_grad():
@@ -80,9 +116,14 @@ def main():
                 img_idx += 1
                 # if img_idx < 2500:
                 #     continue
-                imgs, objs, boxes, triples, obj_to_img, triple_to_img = [x.cuda() for x in batch_data]
+                if args.eval_set == "":
+                    imgs, objs, boxes, triples, obj_to_img, triple_to_img = [x.cuda() for x in batch_data]
+                    file_name_id = img_idx
+                else:
+                    imgs, objs, boxes, triples, file_name_id, obj_to_img, triple_to_img = [x.cuda() for x in batch_data]
+                    file_name_id = file_name_id.item()
 
-                scene_graph_path = os.path.join(scene_graph_dir, str(img_idx)+'_graph.png')
+                scene_graph_path = os.path.join(scene_graph_dir, str(file_name_id)+'_graph.png')
 
                 draw_scene_graph(objs=objs, triples=triples, vocab=vocab, output_filename=scene_graph_path)                
                 graph_info = [imgs, objs, None, triples, obj_to_img, triple_to_img]
@@ -101,9 +142,9 @@ def main():
                     x_samples_ddim = x_samples_ddim.squeeze(0)
                     x_samples_ddim = 255. * rearrange(x_samples_ddim, 'c h w -> h w c').cpu().numpy()
                     results = Image.fromarray(x_samples_ddim.astype(np.uint8))
-                    results.save(os.path.join(generate_img_dir, str(img_idx)+'_'+str(num_sample)+'_img.png'))
+                    results.save(os.path.join(generate_img_dir, str(file_name_id)+'_'+str(num_sample)+'_img.png'))
                 gt_img = to_pil_image(imgs[0], mode="RGB")
-                gt_img.save(os.path.join(gt_img_dir, str(img_idx)+'_gt.png'))
+                gt_img.save(os.path.join(gt_img_dir, str(file_name_id)+'_gt.png'))
                 # if img_idx > 3000:
                 #     break
     return None
@@ -326,6 +367,108 @@ def vg_collate_fn(batch):
     out = (all_imgs, all_objs, all_boxes, all_triples, all_obj_to_img, all_triple_to_img)
     return out
 
+class VgSceneGraphDatasetCustomized(Dataset):
+    def __init__(self, use_vocab_path, data_vocab_path, data_path, image_dir, image_size=(256, 256),
+                 max_objects=10, max_samples=None, include_relationships=True, use_orphaned_objects=True):
+        super(VgSceneGraphDatasetCustomized, self).__init__()
+        with open(use_vocab_path, 'r') as f:
+            self.vocab = json.load(f)
+        with open(data_vocab_path, 'rb') as f:
+            data_vocab = pickle.load(f)
+        self.data_ind_to_classes = data_vocab['ind_to_classes']
+        self.data_ind_to_predicates = data_vocab['ind_to_predicates']
+        with open(data_path, 'rb') as f:
+            self.data = pickle.load(f)
+        self.image_dir = image_dir
+        self.image_size = image_size
+        transform = [Resize(image_size), transforms.ToTensor()]  # augmentation
+        self.transform = transforms.Compose(transform)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        item = self.data[index]
+        file_name = item['file_name']
+        file_name_id = int(file_name.split('.')[0])
+        img_path = os.path.join(self.image_dir, file_name)
+
+        # image
+        with open(img_path, 'rb') as f:
+            with PIL.Image.open(f) as image:
+                image = self.transform(image.convert('RGB'))
+
+        # object labels
+        num_nodes = item['node_labels'].shape[0]
+        O = num_nodes + 1
+        objs = torch.LongTensor(O).fill_(-1)
+        for node_idx in range(num_nodes):
+            node_name = self.data_ind_to_classes[item['node_labels'][node_idx]]
+            assert (node_name in self.vocab['object_name_to_idx'])
+            objs[node_idx] = self.vocab['object_name_to_idx'][node_name]
+        objs[O - 1] = self.vocab['object_name_to_idx']['__image__']
+
+        # object boxes
+        node_bboxes_xcyc = item['node_bboxes_xcyc']
+        node_bboxes_xyxy = np.zeros_like(node_bboxes_xcyc)
+        node_bboxes_xyxy[:, 0] = (node_bboxes_xcyc[:, 0] - node_bboxes_xcyc[:, 2]/2).clip(0, 1)
+        node_bboxes_xyxy[:, 1] = (node_bboxes_xcyc[:, 1] - node_bboxes_xcyc[:, 3]/2).clip(0, 1)
+        node_bboxes_xyxy[:, 2] = (node_bboxes_xcyc[:, 0] + node_bboxes_xcyc[:, 2]/2).clip(0, 1)
+        node_bboxes_xyxy[:, 3] = (node_bboxes_xcyc[:, 1] + node_bboxes_xcyc[:, 3]/2).clip(0, 1)
+        assert (np.all(node_bboxes_xyxy[:, 2] >= node_bboxes_xyxy[:, 0]))
+        assert (np.all(node_bboxes_xyxy[:, 3] >= node_bboxes_xyxy[:, 1]))
+        boxes = torch.FloatTensor([[0, 0, 1, 1]]).repeat(O, 1)
+        boxes[:num_nodes] = torch.FloatTensor(node_bboxes_xyxy)
+
+        # triplets
+        edge_map = item['edge_map']
+        subj_node_idx, obj_node_idx = np.where(edge_map)
+        subj_node_idx_list = list(subj_node_idx)
+        obj_node_idx_list = list(obj_node_idx)
+        triples = []
+        for subj_idx, obj_idx in zip(subj_node_idx_list, obj_node_idx_list):
+            edge_name = self.data_ind_to_predicates[edge_map[subj_idx, obj_idx]]
+            if edge_name in self.vocab['pred_name_to_idx']:
+                triples.append([subj_idx, self.vocab['pred_name_to_idx'][edge_name], obj_idx])
+
+        # Add dummy __in_image__ relationships for all objects
+        in_image = self.vocab['pred_name_to_idx']['__in_image__']
+        for i in range(O - 1):
+            triples.append([i, in_image, O - 1])
+
+        triples = torch.LongTensor(triples)
+        return image, objs, boxes, triples, file_name_id
+
+def vg_collate_fn_customized(batch):
+    all_imgs, all_objs, all_boxes, all_triples = [], [], [], []
+    all_file_name_id = []
+    all_obj_to_img, all_triple_to_img = [], []
+    obj_offset = 0
+    for i, (img, objs, boxes, triples, file_name_id) in enumerate(batch):
+        all_imgs.append(img[None])
+        O, T = objs.size(0), triples.size(0)
+        all_objs.append(objs)
+        all_boxes.append(boxes)
+        triples = triples.clone()
+        triples[:, 0] += obj_offset
+        triples[:, 2] += obj_offset
+        all_triples.append(triples)
+        all_file_name_id.append(torch.tensor([file_name_id]))
+
+        all_obj_to_img.append(torch.LongTensor(O).fill_(i))
+        all_triple_to_img.append(torch.LongTensor(T).fill_(i))
+        obj_offset += O
+
+    all_imgs = torch.cat(all_imgs)
+    all_objs = torch.cat(all_objs)
+    all_boxes = torch.cat(all_boxes)
+    all_triples = torch.cat(all_triples)
+    all_file_name_id = torch.cat(all_file_name_id)
+    all_obj_to_img = torch.cat(all_obj_to_img)
+    all_triple_to_img = torch.cat(all_triple_to_img)
+
+    out = (all_imgs, all_objs, all_boxes, all_triples, all_file_name_id, all_obj_to_img, all_triple_to_img)
+    return out
 
 if __name__ == '__main__':
     main()
